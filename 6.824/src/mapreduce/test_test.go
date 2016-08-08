@@ -23,9 +23,9 @@ const (
 // Check if we have N numbers in output file
 
 // Split in words
+// 分割单词
 func MapFunc(file string, value string) (res []KeyValue) {
-	debug("Map %v\n", value)
-	words := strings.Fields(value)
+	words := strings.Fields(value) // 分隔空格隔开的单词
 	for _, w := range words {
 		kv := KeyValue{w, ""}
 		res = append(res, kv)
@@ -144,7 +144,8 @@ func cleanup(mr *Master) {
 }
 
 func TestSequentialSingle(t *testing.T) {
-	mr := Sequential("test", makeInputs(1), 1, MapFunc, ReduceFunc)
+	//mr := Sequential("test", makeInputs(1), 1, MapFunc, ReduceFunc)
+	mr := Sequential("test", makeInputs(1), 3, MapFunc, ReduceFunc)
 	mr.Wait()
 	check(t, mr.files)
 	checkWorker(t, mr.stats)
