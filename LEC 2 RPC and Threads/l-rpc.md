@@ -1,6 +1,6 @@
 ##6.824 2016 Lecture 2: 基础设施: RPC和多线程
 
-[原文地址](https://pdos.csail.mit.edu/6.824/labs/lab-1.html)
+[原文地址](https://pdos.csail.mit.edu/6.824/notes/l-rpc.txt)
 
 ##### 被问的最多的问题？　为什么这么课程选择了Go？
 + 6.824这门课程过去选择使用C++
