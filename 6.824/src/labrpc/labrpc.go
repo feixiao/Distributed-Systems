@@ -57,22 +57,25 @@ import "strings"
 import "math/rand"
 import "time"
 
+// RPC请求消息
 type reqMsg struct {
-	endname  interface{} // name of sending ClientEnd
-	svcMeth  string      // e.g. "Raft.AppendEntries"
-	argsType reflect.Type
-	args     []byte
-	replyCh  chan replyMsg
+	endname  interface{}  // name of sending ClientEnd
+	svcMeth  string       // e.g. "Raft.AppendEntries"
+	argsType reflect.Type 	// 参数类型
+	args     []byte     	// 请求参数
+	replyCh  chan replyMsg  // 接收回复的通道
 }
 
+// RPC回复消息
 type replyMsg struct {
 	ok    bool
 	reply []byte
 }
 
+// 端点
 type ClientEnd struct {
-	endname interface{} // this end-point's name
-	ch      chan reqMsg // copy of Network.endCh
+	endname interface{} 	// this end-point's name
+	ch      chan reqMsg 	// copy of Network.endCh
 }
 
 // send an RPC, wait for the reply.
@@ -82,17 +85,20 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	req := reqMsg{}
 	req.endname = e.endname
 	req.svcMeth = svcMeth
+	// 使用反射查找参数类型
 	req.argsType = reflect.TypeOf(args)
 	req.replyCh = make(chan replyMsg)
 
+	// 序列化参数
 	qb := new(bytes.Buffer)
 	qe := gob.NewEncoder(qb)
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
-	e.ch <- req
+	// 发送请求
+	e.ch <- req             // 引用Network.endCh，会在Network中得到处理
 
-	rep := <-req.replyCh
+	rep := <-req.replyCh	// 获取回复,反序列化结果
 	if rep.ok {
 		rb := bytes.NewBuffer(rep.reply)
 		rd := gob.NewDecoder(rb)
@@ -105,6 +111,7 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	}
 }
 
+// 网络结构:模拟网络,记录一些网络上面的连接信息
 type Network struct {
 	mu             sync.Mutex
 	reliable       bool
@@ -157,6 +164,7 @@ func (rn *Network) LongDelays(yes bool) {
 	rn.longDelays = yes
 }
 
+// 通过名字获取到配置信息
 func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	servername interface{}, server *Server, reliable bool, longreordering bool,
 ) {
@@ -173,6 +181,7 @@ func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	return
 }
 
+// 通过检索Network中的网络信息确定服务器是否还活着
 func (rn *Network) IsServerDead(endname interface{}, servername interface{}, server *Server) bool {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -183,12 +192,13 @@ func (rn *Network) IsServerDead(endname interface{}, servername interface{}, ser
 	return false
 }
 
+// 处理ClientEnd.Call(),在一个单独的goroutine中处理
 func (rn *Network) ProcessReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
 
 	if enabled && servername != nil && server != nil {
 		if reliable == false {
-			// short delay
+			// 模拟延迟
 			ms := (rand.Int() % 27)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
@@ -205,7 +215,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		// failure reply.
 		ech := make(chan replyMsg)
 		go func() {
-			r := server.dispatch(req)
+			r := server.dispatch(req)  // 分发请求
 			ech <- r
 		}()
 

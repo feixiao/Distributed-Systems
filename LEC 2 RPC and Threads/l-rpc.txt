@@ -1,0 +1,273 @@
+6.824 2016 Lecture 2: Infrastructure: RPC and threads
+
+Most commonly-asked question: Why Go?
+  6.824 used to use C++
+    students spent time fixing bugs unrelated to distributed systems
+      e.g., they freed objects that were still in use
+  Go allows you to concentrate on distributed systems problems
+    type safe
+    garbage-collected (no use after freeing problems)
+    good support for concurrency
+    good support for RPC
+  We like programming in Go
+    simple language to learn
+  After the tutorial, use https://golang.org/doc/effective_go.html
+
+Remote Procedure Call (RPC)
+  a key piece of distributed system machinery; all the labs use RPC
+  goal: easy-to-program network communication
+    hides most details of client/server communication
+    client call is much like ordinary procedure call
+    server handlers are much like ordinary procedures
+  RPC is widely used!
+
+RPC ideally makes net communication look just like fn call:
+  Client:
+    z = fn(x, y)
+  Server:
+    fn(x, y) {
+      compute
+      return z
+    }
+  RPC aims for this level of transparency
+
+Go example:
+  https://golang.org/pkg/net/rpc/
+
+RPC message diagram:
+  Client             Server
+    request--->
+       <---response
+
+Software structure
+  client app         handlers
+    stubs           dispatcher
+   RPC lib           RPC lib
+     net  ------------ net
+ 
+A few details:
+  Which server function (handler) to call?
+  Marshalling: format data into packets
+    Tricky for arrays, pointers, objects, &c
+    Go's RPC library is pretty powerful!
+    some things you cannot pass: e.g., channels, functions
+  Binding: how does client know who to talk to?
+    Maybe client supplies server host name
+    Maybe a name service maps service names to best server host
+  Threads:
+    Clients may have many threads, so > 1 call outstanding, match up replies
+    Handlers may be slow, so server often runs each in a thread
+
+RPC problem: what to do about failures?
+  e.g. lost packet, broken network, slow server, crashed server
+
+What does a failure look like to the client RPC library?
+  Client never sees a response from the server
+  Client does *not* know if the server saw the request!
+    Maybe server/net failed just before sending reply
+  [diagram of lost reply]
+
+Simplest scheme: "at least once" behavior
+  RPC library waits for response for a while
+  If none arrives, re-send the request
+  Do this a few times
+  Still no response -- return an error to the application
+
+Q: is "at least once" easy for applications to cope with?
+
+Simple problem w/ at least once:
+  client sends "deduct $10 from bank account"
+
+Q: what can go wrong with this client program?
+  Put("k", 10) -- an RPC to set key's value in a DB server
+  Put("k", 20) -- client then does a 2nd Put to same key
+  [diagram, timeout, re-send, original arrives very late]
+
+Q: is at-least-once ever OK?
+  yes: if it's OK to repeat operations, e.g. read-only op
+  yes: if application has its own plan for coping w/ duplicates
+    which you will need for Lab 1
+
+Better RPC behavior: "at most once"
+  idea: server RPC code detects duplicate requests
+    returns previous reply instead of re-running handler
+  Q: how to detect a duplicate request?
+  client includes unique ID (XID) with each request
+    uses same XID for re-send
+  server:
+    if seen[xid]:
+      r = old[xid]
+    else
+      r = handler()
+      old[xid] = r
+      seen[xid] = true
+
+some at-most-once complexities
+  this will come up in labs 2 and on
+  how to ensure XID is unique?
+    big random number?
+    combine unique client ID (ip address?) with sequence #?
+  server must eventually discard info about old RPCs
+    when is discard safe?
+    idea:
+      unique client IDs
+      per-client RPC sequence numbers
+      client includes "seen all replies <= X" with every RPC
+      much like TCP sequence #s and acks
+    or only allow client one outstanding RPC at a time
+      arrival of seq+1 allows server to discard all <= seq
+    or client agrees to keep retrying for < 5 minutes
+      server discards after 5+ minutes
+  how to handle dup req while original is still executing?
+    server doesn't know reply yet; don't want to run twice
+    idea: "pending" flag per executing RPC; wait or ignore
+
+What if an at-most-once server crashes and re-starts?
+  if at-most-once duplicate info in memory, server will forget
+    and accept duplicate requests after re-start
+  maybe it should write the duplicate info to disk?
+  maybe replica server should also replicate duplicate info?
+
+What about "exactly once"?
+  at-most-once plus unbounded retries plus fault-tolerant service
+  Lab 3
+
+Go RPC is "at-most-once"
+  open TCP connection
+  write request to TCP connection
+  TCP may retransmit, but server's TCP will filter out duplicates
+  no retry in Go code (i.e. will NOT create 2nd TCP connection)
+  Go RPC code returns an error if it doesn't get a reply
+    perhaps after a timeout (from TCP)
+    perhaps server didn't see request
+    perhaps server processed request but server/net failed before reply came back
+
+Go RPC's at-most-once isn't enough for Lab 1
+  it only applies to a single RPC call
+  if worker doesn't respond, the master re-send to it to another worker
+    but original worker may have not failed, and is working on it too
+  Go RPC can't detect this kind of duplicate
+    No problem in lab 1, which handles at application level
+    Lab 2 will explicitly detect duplicates
+
+Threads
+  threads are a fundamental server structuring tool
+  you'll use them a lot in the labs
+  they can be tricky
+  useful with RPC 
+  Go calls them goroutines; everyone else calls them threads
+
+Thread = "thread of control"
+  threads allow one program to (logically) do many things at once
+  the threads share memory
+  each thread includes some per-thread state:
+    program counter, registers, stack
+
+Threading challenges:
+  sharing data 
+     two threads modify the same variable at same time?
+     one thread reads data that another thread is changing?
+     these problems are often called races
+     need to protect invariants on shared data
+     use Go sync.Mutex
+  coordination between threads
+    e.g. wait for all Map threads to finish
+    use Go channels
+  deadlock 
+     thread 1 is waiting for thread 2
+     thread 2 is waiting for thread 1
+     easy detectable (unlike races)
+  lock granularity
+     coarse-grained -> simple, but little concurrency/parallelism
+     fine-grained -> more concurrency, more races and deadlocks
+  let's look at labrpc RPC package to illustrate these problems
+
+look at today's handout -- labrpc.go
+  it similar to Go's RPC system, but with a simulated network
+    the network delays requests and replies
+    the network loses requests and replies
+    the network re-orders requests and replies
+    useful for testing labs 2 etc.
+  illustrates threads, mutexes, channels
+  complete RPC package is written in Go itself
+
+structure
+  
+
+
+struct Network
+  description of network
+    servers
+    client endpoints
+  mutex per network
+
+RPC overview
+  many examples in test_test.go
+    e.g., TestBasic()
+  application calls Call()
+     reply := end.Call("Raft.AppendEntries", args, &reply) --   send an RPC, wait for reply
+  servers side:
+     srv := MakeServer()
+     srv.AddService(svc) -- a server can have multiple services, e.g. Raft and k/v
+       pass srv to net.AddServer()
+     svc := MakeService(receiverObject) -- obj's methods will handle RPCs
+       much like Go's rpcs.Register()
+       pass svc to srv.AddService()
+
+struct Server
+  a server support many services
+
+AddService
+  add a service name
+  Q: why a lock?
+  Q: what is defer()?
+  
+Dispatch
+  dispatch a request to the right service
+  Q: why hold a lock?
+  Q: why not hold lock to end of function?
+
+Call():
+  Use reflect to find type of argument
+  Use gob marshall argument
+  e.ch is the channel to the network to send request
+  Make a channel to receive reply from network ( <- req.replyCh)
+
+MakeEnd():
+  has a thread/goroutine that simulates the network
+    reads from e.ch and process requests
+    each requests is processed in a separate goroutine
+      Q: can an end point have many outstanding requests?
+    Q: why rn.mu.Lock()?
+    Q: what does lock protect?
+
+ProcessReq():
+  finds server endpoint
+  if network unreliable, may delay and drop requests,
+  dispatch request to server in a new thread
+  waits on reply by reading ech or until 100 msec has passed
+    100 msec just to see if server is dead
+  then return reply
+    Q: who will read the reply?
+  Q: is ok that ProcessReq doesn't hold rn lock?
+
+Service.dispatch():
+ find method for a request
+ unmarshall arguments
+ call method
+ marshall reply
+ return reply
+
+Go's "memory model" requires explicit synchronization to communicate!
+  This code is not correct:
+    var x int
+    done := false
+    go func() { x = f(...); done = true }
+    while done == false { }
+  it's very tempting to write, but the Go spec says it's undefined
+  use a channel or sync.WaitGroup or instead
+
+Study the Go tutorials on goroutines and channels
+  Use Go's race detector:
+    https://golang.org/doc/articles/race_detector.html
+    go test --race mypkg
