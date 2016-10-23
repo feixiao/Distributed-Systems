@@ -1,0 +1,269 @@
+6.824 2014 Lecture 3: GFS Case Study
+
+The Google File System
+Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung
+SOSP 2003
+
+Why are we reading this paper?
+  the file system for map/reduce
+  case study of handling storage failures
+    trading consistency for simplicity and performance
+    motivation for subsequent designs
+  good performance -- great parallel I/O performance
+  good systems paper -- details from apps all the way to network
+  all main themes of 6.824 show up in this paper
+    performance, fault-tolerance, consistency
+
+What is consistency?
+  A correctness condition
+  Important when data is replicated and concurrently accessed by applications 
+    if an application performs a write, what will a later read observe?
+      what if the read is from a different application?
+  Weak consistency
+    read() may return stale data  --- not the result of the most recent write
+  Strong consistency
+    read() always returns the data from the most recent write()
+  General trade-off:
+    strong consistency is nice for application writers
+    strong consistency is bad for performance
+  Many correctness conditions (often called consistency models)
+
+History of consistency models
+  Much independent development in architecture, systems, and database communities
+    Concurrent processors with private caches accessing a shared memory
+    Concurrent clients accessing a distributed file system
+    Concurrent transactions on distributed database
+  Many different models with different trade-offs
+    serializability
+    sequential consistency
+    linearizability
+    entry consistency
+    release consistency
+    ....
+  Today first peak; will show up in almost every paper we read this term
+    
+"Ideal" consistency model
+  A replicated files behaves like as a non-replicated file system
+    picture: many clients on the same machine accessing files on a single disk
+  If one application writes, later reads will observe that write
+  What if two application concurrently write to the same file
+    In file systems often undefined  --- file may have some mixed content
+  What if two application concurrently write to the same directory
+    One goes first, the other goes second
+
+Sources of inconsistency
+  Concurrency
+  Machine failures
+  Network partitions
+
+Example from GFS paper:
+  primary is partitioned from backup B
+  client appends 1
+  primary sends 1 to itself and backup A
+  reports failure to client
+  meanwhile client 2 may backup B and observe old value
+
+Why is the ideal difficult to achieve in a distributed file system
+  Protocols can become complex --- see next week
+    Difficult to implement system correctly
+  Protocols require communication between clients and servers
+    May cost performance
+    
+GFS designers give up on ideal to get better performance and simpler design
+  Can make life of application developers harder
+    application observe behaviors that are non-observable in an ideal system
+    e.g., reading stale data
+    e.g., duplicate append records
+    But the data isn't your bank account, so maybe ok
+  Today's paper is an example of the struggle between:
+   consistency
+   fault-tolerance
+   performance
+   simplicity of design
+
+GFS goal
+  create a shared file system
+  hundreds or thousands of (commodity, Linux based) physical machines
+  to enable storing massive data sets
+
+What does GFS store?
+  authors don't actually say
+  guesses for 2003:
+    search indexes & databases
+    all the HTML files on the web
+    all the images on the web
+    ...
+
+Properties of files:
+  Multi-terabyte data sets
+  Many of the files are large
+  Authors suggest 1M files x 100 MB = 100 TB
+    but that was in 2003
+  Files are generally append only
+
+Central challenge:
+  With so many machines failures are common
+    assume a machine fails once per year
+    w/ 1000 machines, ~3 will fail per day.
+  High-performance: many concurrent readers and writers
+    Map/Reduce jobs read and store final result in GFS
+    Note: *not* the temporary, intermediate files
+  Use network efficiently
+
+High-level design
+  Directories, files, names, open/read/write
+    But not POSIX
+  100s of Linux chunk servers with disks
+    store 64MB chunks (an ordinary Linux file for each chunk)
+    each chunk replicated on three servers
+    Q: why 3x replication?
+    Q: Besides availability of data, what does 3x replication give us?
+       load balancing for reads to hot files affinity
+    Q: why not just store one copy of each file on a RAID'd disk?
+       RAID isn't commodity
+       Want fault-tolerance for whole machine; not just storage device
+    Q: why are the chunks so big?
+  GFS master server knows directory hierarchy
+    for dir, what files are in it
+    for file, knows chunk servers for each 64 MB
+    master keeps state in memory
+      64 bytes of metadata per each chunk
+    master has private recoverable database for metadata
+      master can recovery quickly from power failure
+    shadow masters that lag a little behind master
+      can be promoted to master
+      
+Basic operation
+  client read:
+    send file name and offset to master
+    master replies with set of servers that have that chunk
+      clients cache that information for a little while
+    ask nearest chunk server
+  client write:
+    ask master where to store
+    maybe master chooses a new set of chunk servers if crossing 64 MB
+    one chunk server is primary
+    it chooses order of updates and forwards to two backups
+
+Two different fault-tolerance plans
+  One for master
+  One for chunk servers
+
+Master fault tolerance
+  Single master
+    Clients always talk to master
+    Master orders all operations
+  Stores limited information persistently
+    name spaces (directories)
+    file-to-chunk mappings
+  Log changes to these two in a log
+    log is replicated on several backups
+    clients operations that modify state return *after* recording changes in *logs*
+    logs play a central role in many systems we will read about
+    logs play a central role in labs
+  Limiting the size of the log
+    Make a checkpoint of the master state
+    Remove all operations from log from before checkpoint
+    Checkpoint is replicated to backups
+  Recovery
+    replay log starting from last checkpoint
+    chunk location information is recreated by asking chunk servers
+  Master is single point of failure
+    recovery is fast, because master state is small
+      so maybe unavailable for short time
+    shadow masters
+      lag behind master
+        they replay from the log that is replicated
+      can server read-only operations, but may return stale data
+    if master cannot recovery, master is started somewhere else
+    must be done with great care to avoid two masters
+  We will see schemes with stronger guarantees, but more complex
+    see next few lectures
+
+Chunk fault tolerance
+  Master grants a chunk lease to one of the replicas
+    That replica is the primary chunk server
+  Primary determines orders operations
+  Clients pushes data to replicas
+    Replicas form a chain
+    Chain respects network topology
+    Allows fast replication
+  Client sends write request to primary
+    Primary assigns sequence number
+    Primary applies change locally
+    Primary forwards request to replicates
+    Primary responds to client after receiving acks from all replicas
+  If one replica doesn't respond, client retries
+  Master replicates chunks if number replicas drop below some number
+  Master rebalances replicas
+
+Consistency of chunks
+  Some chunks may get out of date
+    they miss mutations
+  Detect stale data with chunk version number
+    before handing out a lease
+      increments chunk version number
+       sends it to primary and backup chunk servers
+    master and chunk servers store version persistently
+  Send version number also to client
+  Version number allows master and client to detect stale replicas
+
+Concurrent writes/appends
+  clients may write to the same region of file concurrently
+  the result is some mix of those writes--no guarantees
+    few applications do this anyway, so it is fine
+    concurrent writes on Unix can also result in a strange outcome
+  many client may want to append concurrently to, e.g., a log file
+    GFS support atomic, at-least-once append
+    the primary chunk server chooses the offset where to append a record
+    sends it to all replicas.
+    if it fails to contact a replica, the primary reports an error to client
+    client retries; if retry succeeds:
+      some replicas will have the append twice (the ones that succeeded)
+    the file may have a "hole" too
+      when GFS pads to chunk boundary, if an append would across chunk boundary
+  
+Consistency model
+  Strong consistency for directory operations
+    Master performs changes to metadata atomically
+    Directory operations follow the "ideal"
+    But, when master is off-line, only shadow masters
+      Read-only operations only, which may return stale data
+  Weak consistency for chunk operations
+    A failed mutation leaves chunks inconsistent
+      The primary chunk server updated chunk
+      But then failed and the replicas are out of date
+    A client may read an not-up-to-date chunk
+    When client refreshes lease it will learn about new version #
+  Authors claims weak consistency is not a big problems for apps    
+    Most file updates are append-only updates
+      Application can use UID in append records to detect duplicates
+      Application may just read less data (but not stale data)
+    Application can use temporary files and atomic rename
+    
+Performance (Figure 3)
+  huge aggregate throughput for read (3 copies, striping)
+    125 MB/sec in aggregate
+    Close to saturating network
+  writes to different files lower than possible maximum
+    authors blame their network stack
+    it causes delays in propagating chunks from one replica to next
+  concurrent appends to single file
+    limited by the server that stores last chunk
+    
+Summary
+  Important FT techniques used by GFS
+    Logging & checkpointing
+    Primary-backup replication for chunks
+      but with consistencies
+    We will these in many other systems  
+  what works well in GFS?
+    huge sequential reads and writes
+    appends
+    huge throughput (3 copies, striping)
+    fault tolerance of data (3 copies)
+  what less well in GFS?
+    fault-tolerance of master
+    small files (master a bottleneck)
+    concurrent updates to same file from many clients (except appends)
+
