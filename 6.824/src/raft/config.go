@@ -7,6 +7,8 @@ package raft
 // so, while you can modify this code to help you debug, please
 // test with the original before submitting.
 //
+// 我们使用最初的config.go文件分级测试你们的代码,所以你们可与修改这边的代码帮助你们调试，
+// 请在提交之前测试。
 
 import "labrpc"
 import "log"
@@ -19,8 +21,9 @@ import "sync/atomic"
 import "time"
 import "fmt"
 
+// 产生随机字符串
 func randstring(n int) string {
-	b := make([]byte, 2*n)
+	b := make([]byte, 2*n)  // 为什么申请了两倍空间？
 	crand.Read(b)
 	s := base64.URLEncoding.EncodeToString(b)
 	return s[0:n]
