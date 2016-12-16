@@ -1,0 +1,231 @@
+6.824 2016 Lecture 5: Raft (1)
+
+this lecture
+  today: Raft (lab 2)
+  next: using Raft in a key/value server (lab 3)
+
+overall topic: fault-tolerant services using state machine replication (SRM)
+  [clients, replica servers]
+  each replica server executes same operations in same order
+  result: they remain replicas as they execute
+  with care, any replica could take over if one failed
+    i.e. on failure, client switches to another server
+  both GFS and VMware FT have this flavor
+
+what's a typical "state machine"?
+  it's the application, or service, being replicated
+  internal state, sequence of input commands, outputs
+    "sequence" means no parallelism
+    must be deterministic
+    cannot communicate outside state machine (other than via input and output)
+  from here on we'll be talking about fairly high-level services
+  example: configuration server, like MapReduce or GFS master
+  example: key/value storage server, put()/get() (lab3)
+
+a critical question: how to avoid split brain?
+  suppose client can contact replica A, but not replica B
+  can client proceed with just replica A?
+  if B has really crashed, we *must* proceed without B,
+    otherwise we can't tolerate faults!
+  if B is up but network prevents us from contacting it,
+    maybe we should *not* proceed without it,
+    since it might be alive and serving other clients -- risking split brain
+    "network partition"
+  in general we cannot distinguish between "crashed" and "partitioned"
+
+one can avoid split brain using a single "master"
+  master computer decides whether A or B is the primary
+    there's just one master, so it never disagrees with itself
+  clients talk to the master
+  this is probably what VMware FT does (atomic test-and-set in shared disk)
+  but what if the master fails?
+    it's a "single point of failure" -- not so good
+
+We want a state-machine replication scheme that:
+  has no single point of failure -- can proceed despite any one failure 
+  handles partition w/o split brain
+
+The big insight for coping w/ partition: majority vote
+  2f+1 servers, e.g. 3 or 5
+  must get majority (f+1) of votes to make progress, e.g. become primary
+    thus can can proceed despite failure of up to f servers
+    no single point of failure
+  why no split brain?
+    at most one partition can have a majority
+  note: majority is out of all 2f+1 servers, not just out of live ones
+  the really critical thing about majorities is that any two must intersect
+    servers in the intersection will only vote one way or the other
+    and we'll later see that the intersection conveys other information
+
+Two majority replication schemes were invented around 1990,
+  Paxos and View-Stamped Replication
+  in the last 10 years this technology has seen a lot of real-world use
+  Raft is a particularly nice description of the ideas
+
+MapReduce, GFS, and VMware FT would all benefit from SRM
+  MapReduce master wasn't replicated
+  GFS master was replicated but no story for automatic switch to backup
+  VMware FT shared disk atomic test-and-set was (apparently) not replicated
+
+state machine replication with Raft -- big picture:
+  [diagram: clients, replicas, k/v layer, raft layer, logs]
+  >= three replicas
+  Raft picks one server to be leader
+  clients send RPCs to k/v layer in leader
+    Put, Get, Append
+  leader sends each client command to all replicas
+    each follower appends to log
+    goal is to have identical logs
+    converts concurrent client Put(a,1) Put(a,2) into agreed order
+  entry is "committed" if a majority put it in their logs -- won't be forgotten
+    majority -> can proceed despite minority of failed servers
+  servers execute entry once leader says it's committed
+    k/v layer applies Put to DB, or fetches Get result
+  then leader replies to client w/ execution result
+
+why the logs?
+  the service keeps the state machine state, e.g. key/value DB
+    why isn't that enough?
+  what if a follower misses a few of leader's commands?
+    how to bring it up to date efficiently?
+    answer: re-send the missing commands
+  the log is the sequence of commands so far
+    it's equivalent to state -- starting state + log = final state
+  the log also gives a convenient numbering scheme, to order the operations
+  and the log is a holding area until we're sure a command is committed
+
+will the Raft logs always be exact replicas?
+  no: some replicas may lag
+  no: we'll see that they can have different entries!
+  the good news:
+    if a server has executed a command in a given entry number,
+    no other server will execute a different command for that entry.
+    i.e. the servers will agree on the command for each entry.
+    State Machine Safety (Figure 3)
+
+lab 2 Raft interface
+  rf.Start(command) (index, term, isleader)
+    start agreement on a new log entry
+    returns immediately; will succeed (or not) later
+    might not succeed if server loses leadership before committing command
+    index indicates what log entry to watch
+  ApplyMsg, with Index and Command
+    Raft generates a message on a channel when the service (k/v server)
+    should execute a new command. this also notifies client RPC handler
+    on leader so it can reply to the client.
+
+note: leader should not wait for replies to the AppendEntries RPCs!
+  don't want to be blocked by failed servers
+  so send each in a goroutine
+  this means the RPCs may arrive out of order
+
+there are two main parts to Raft's design:
+  electing a new leader
+  ensuring identical logs after failures
+
+Raft numbers the sequence of leaders
+  new leader -> new term
+  a term has at most one leader; might have no leader
+  the numbering helps servers follow latest leader, not superseded leader
+
+when does Raft start a leader election?
+  other servers don't hear from current leader for a while
+  they increment local currentTerm, become candidates, start election
+
+how to ensure at most one leader in a term?
+  (Figure 2 RequestVote RPC and Rules for Servers)
+  leader must get votes from a majority of servers
+  each server can cast only one vote per term
+    votes for first server that asks (within Figure 2 rules)
+  at most one server can get majority of votes for a given term
+    -> at most one leader even if network partition
+    -> election can succeed even if some servers have failed
+
+how does a server know that election succeeded?
+  winner gets yes votes from majority
+  others see the AppendEntries heart-beats from winner
+
+an election may not succeed
+  >= 3 candidates split the vote, none gets majority
+  even # of live servers, two candidates each get half
+  less than a majority of servers are reachable
+
+what happens after a failed election?
+  another timeout, increment currentTerm, become candidate
+  higher term takes precedence, candidates for older terms quit
+
+how does Raft reduce chances of election failure due to split vote?
+  each server delays a random amount of time before starting candidacy
+  why is the random delay useful?
+    [diagram of times at which servers' delays expire]
+    one will choose lowest random delay
+    hopefully enough time to elect before next timeout expires
+    others will see new leader's AppendEntries heartbeats and 
+      not become candidates
+
+how to choose the random delay range?
+  too short: 2nd candidate starts before first finishes
+  too long: system sits idle for too long after leader fails
+  a rough guide:
+    suppose it takes 10ms to complete an unopposed election
+    and there are five servers
+    we want delays to be separated by (say) 20ms
+    so random delay from 0 to 100 ms
+
+Raft's elections follow a common pattern: separation of safety from progress
+  hard mechanisms rule out > 1 leader, to avoid split brain
+    but might be no leader, or unknown outcome
+  soft mechanisms try to ensure progress
+    always safe to start a new election in a new term
+  soft mechanisms try to avoid unnecessary elections
+    heartbeat from leader (remind servers not to start election)
+    timeout period (don't start election too soon)
+    random delays (give one leader time to be elected)
+
+what if old leader isn't aware a new one is elected?
+  perhaps old leader didn't see election messages
+  new leader means a majority of servers have incremented currentTerm
+    so old leader (w/ old term) can't get majority for AppendEntries
+    so old leader won't commit or execute any new log entries
+    thus no split brain despite partition
+    but a minority may accept old server's AppendEntries
+      so logs may diverge at end of old term
+
+now let's talk about synchronizing logs after failures
+
+what do we want to ensure?
+  perhaps: each server executes the same client cmds, in the same order
+    not quite; failed servers might not execute anything
+  thus: if any server executes, then no server executes something
+    else for that log entry
+    Figure 3's State Machine Safety
+  as long as single leader, easy to prevent disagreement in logs
+
+how can logs disagree?
+  a log might be short -- missing entries at end of the term
+    leader of term 3 crashes before sending all AppendEntries
+    S1: 3
+    S2: 3 3
+    S3: 3 3
+  logs might have different commands in same entry!
+    after a series of leader crashes, e.g.
+        10 11 12 13  <- log entry #
+    S1:  3
+    S2:  3  3  4
+    S3:  3  3  5
+
+new leader will force its log on followers; example:
+  S3 is chosen as new leader for term 6
+  S3 sends a new command, entry 13, term 6
+    AppendEntries, previous entry 12, previous term 5
+  S2 replies false (AppendEntries step 2)
+  S3 decrements nextIndex[S2] to 12
+  S3 sends AppendEntries, prev entry 11, prev term 3
+  S2 deletes entry 12 (AppendEntries step 3)
+  similar story for S1, but have to go back one farther
+
+the result of roll-back:
+  each live follower deletes tail of log that differs from leader
+  thus live followers' logs are prefixes of leader's log
+  and live followers that keep up will have logs identical to leader's
+    except they may be missing the few most recent entries
