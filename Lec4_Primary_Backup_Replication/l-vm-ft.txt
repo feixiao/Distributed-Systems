@@ -1,0 +1,291 @@
+6.824 2016 Lecture 4: Primary/Backup Replication
+
+Today
+  Primary/Backup Replication
+    Widely-used: e.g., GFS chunk servers
+    But today with strong consistency ("Ideal")
+    So important, explore in more depth
+  VM-FT case study
+
+Fault tolerance
+  we'd like a service that continues despite failures!
+  available: still useable despite [some class of] failures
+  strong consistency: act just like a single server to clients
+    stronger than what GFS provides for files
+  very hard!
+  very useful!
+
+Need a failure model: what will we try to cope with?
+  Independent fail-stop computer failure
+   VM-FT further assumes only one failure at a time
+  Site-wide power failure (and eventual reboot)
+  Network partition
+  No bugs, no malice
+
+Core idea: replication
+  *Two* servers (or more)
+  Each replica keeps state needed for the service
+  If one replica fails, others can continue
+
+Example: fault-tolerant MapReduce master
+  lab 1 workers are already fault-tolerant, but not master
+    master is a "single point of failure"
+  can we have two masters, in case one fails?
+  [diagram: M1, M2, workers]
+  state:
+    worker list
+    which jobs done
+    which workers idle
+    TCP connection state
+    program counter
+
+Big Questions:
+  What state to replicate?
+  How does replica get state?
+  When to cut over to backup?
+  Are anomalies visible at cut-over?
+  How to repair / re-integrate?
+
+Two main approaches:
+  State transfer
+    "Primary" replica executes the service
+    Primary sends [new] state to backups
+  Replicated state machine
+    All replicas execute all operations
+    If same start state,
+      same operations,
+      same order,
+      deterministic,
+      then same end state
+
+State transfer is simpler
+  But state may be large, slow to transfer
+  VM-FT uses replicated state machine
+
+Replicated state machine can be more efficient
+  If operations are small compared to data
+  But complex to get right
+    e.g. order on multi-core, determinism
+  Labs use replicated state machines
+
+What is the replicated state machine?
+  K/V put and get?
+  x86 instructions?
+  Impacts performance and ease of implementation
+    how much interaction is necessary between primary and backup
+      high-level abstract machines can communicate less info
+    dealing with non-determinism is hard on x86 level but easier on put/get level
+  higher-level RSM works only for apps that use the higher-level interface
+    x86 RSM can execute any x86 program
+
+The design of a Practical System for Fault-Tolerant Virtual Machines
+Scales, Nelson, and Venkitachalam, SIGOPS OSR Vol 44, No 4, Dec 2010
+
+Very ambitious system:
+  Whole-system replication
+  Completely transparent to applications and clients
+  High availability for any existing software
+  Would be magic if it worked well!
+  Failure model:
+    1. independent hardware faults
+    2. site-wide power failure
+  Limited to uniprocessor VMs
+    Q: What is hard about multicore processors?
+
+Overview
+  [diagram: app, O/S, VM-FT underneath]
+  two machines, primary and backup; and other machines
+  two networks: clients-to-servers, logging channel
+  shared-disk for persistent storage
+  back-up in "lock step" with primary
+    primary sends all inputs to backup
+    outputs of backup are dropped
+  heart beats between primary and backup
+    if primary fails, start backup executing!
+
+What are the inputs?
+  clock interrupts
+  network interrupt
+  disk interrupts
+
+Challenges:
+  1. Making it look  like a single reliable server
+    What will outside world see if primary fails and replica takes over?
+      if primary fails just before or after sending response to client
+      might a client request be lost? executed twice?
+    When does the primary send a response to a client?
+  2. How to avoid two primaries?  (the "split-brain syndrome")
+    What if the logging channel breaks?
+    Will both primary and backup be primaries?
+  3. How to make backup an exact replica of primary
+    What operations must send to backup?
+      Clock interrupts?
+    How to deal with non-determinism?
+      E.g., Interrupt must be delivered at backup at same instruction as at primary
+
+Challenge 3 solution: deterministic replay
+  Goal: make x86 platform deterministic
+    idea: use hypervisor to make virtual x86 platform deterministic
+    two phases: logging and replay
+  Log all hardware events into a log
+    clock interrupts, network interrupts, i/o interrupts, etc.
+    for non-deterministic instructions, record additional info
+      e.g., log the value of the time stamp register
+      on replay: return the value from the log instead of the actual register
+  Replay: delivery inputs in the same order at the same instructions
+    if during recording delivered clock interrupt at nth instruction executed
+    during replay also delivers the clock interrupt at the nth instruction
+  Given a log of events, deterministic replay recreates VM
+    hypervisor delivers first event
+    lets the machine execute to the next event
+      using special hardware registers to stop the processor at the right instruction
+    the virtual x86 executes identical during replay as during recording
+      OS runs identical
+      Applications runs identical
+      -> Same outputs will be generated on replay as during recording
+  Limitation: cannot handle multicore processors x86
+    Too expensive to record and replay the correct interleaving of instructions
+
+Application of deterministic replay to VM-FT:
+  Hypervisor at primary records
+    Sends log entries to backup over logging channel
+  Hypervisor at backup replays log entries
+    We need to stop virtual x86 at instruction of next event
+    We need to what next event is
+    -> backup lags behind one event
+    
+Example:
+  primary receives network interrupt
+    hypervisor forwards interrupt plus data to backup
+    hypervisor delivers network interrupt to OS kernel
+    OS kernel runs
+    kernel delivers packet to server
+    server/kernel write response to network card
+    hypervisor gets control and puts response on the wire
+  backup receives log entries
+    backup delivers network interrupt
+    hypervisor delivers interrupt to its OS kernel
+    ...
+    server/kernel sends response to network card
+    hypervisor gets control
+      does *not* put response on the wire
+    hypervisor ignores local clock interrupts
+      it gets clock interrupts from primary
+  primary and backup get same inputs, end up in same state
+
+Challenge 1 solution: FT protocol
+  Primary delays any output until the backup acks
+    Log entry for each output operation
+    Primary sends output after backup acked receiving output operation
+  Performance optimization:
+    primary keeps executing passed output operations
+    buffers output until backup acknowledges
+
+Q: Why send output events to backup and delay output until backup has acked?
+  Consider: don't log output events. Log only input events.
+  Primary:
+    process network input
+    produces output
+    primary fails
+  Backup cannot reproduce this sequence correctly:
+    last log entry is: process network input
+      deliver it to kernel
+    backup goes "live"
+      it becomes the primary
+    hardware interrupt (e.g., clock)
+      deliver it to the kernel  (since backup is live now)
+    the network input results in output
+      did the primary produce output before hardware interrupt or before?
+      backup doesn't know
+        it doesn't have a log entry for the interrupt
+	it doesn't have a log entry for output
+      important because clock interrupt may have influenced output
+  By sending start output event to backup, backup can order events correctly
+    clock interrupt before or after start output event
+
+Q: Can primary and backup produce the same output event? 
+  A: yes!
+  Primary sends start output event to backup
+  Primary produces output
+  Primary fails
+  Backup declares primary dead
+  Backup replays through the start output event
+  Backup become live
+  Backup executes output event
+  --> Authors claim producing output twice is *not* a problem
+    if output is network packet, client must be able to handle duplicate packets
+    if output is write to disk, write the same data twice to the same location
+      but there cannot any other writes in between (they would have been in the log)
+      so, should be ok
+    if output is read to disk, read the same data twice to the same location in memory
+      use bounce buffers to eliminate DMA race
+      deliver data on I/O completion interrupt
+    
+Q: What happens when primary fails after receiving network input but before
+sending a corresponding log entry to backup?
+  A: network input. service relies on client to retry.
+    this is reasonable because network could have lost request packet
+  A: disk input. hypervisor restarts pending disk I/O
+
+Challenge 2 solution: shared disk
+  Hard problem with only unreliable network!
+    See next week's lectures
+  Paper's solution: assume shared disk
+    Backup replays through last log entry
+    Backup atomically test-and-set variable on disk
+      If set, primary is still alive. Commit suicide
+      If not set, primary is dead. Become primary
+      If primary, create new backup from checkpoint
+        Using VMotion
+      
+Shared storage is single-point of failure
+    If shared storage is down, service is down
+  Ok for paper's setting, but for geo-replicate services
+    Cannot survive earthquakes
+
+Q: Why not have primary record log on shared disk, then backup replays log?
+  Advantage: No logging channel necessary, no FT protocol, etc.
+
+Q: How long is service unavailable after primary fails?
+  Detect failure
+  Execute log entries
+    VM-FT slows down primary if backup gets too far behind
+  Write shared storage
+  Switch to "live"
+
+Implementation challenges:
+  Networking stack
+    Asynchronous events trap to hypervisor
+    Reduce extra delay caused by communicating network output to backup
+  Disk I/O
+    DMA
+
+Performance (table 1)
+  FT/Non-FT: impressive!
+    little slow down
+  Logging bandwidth
+    18 Mbit/s for my-sql
+      Due because backup doesn't read from disk
+      With reading from locak disk: 8 Mbit/s
+  Net apps: FT limits network bandwidth significantly
+    All input packages must be forwarded to backup
+  Not good enough for high-performance services?
+
+Summary:
+  Primary-backup replication
+    VM-FT: clean example
+  How to deal with split-brain syndrom?
+    Next lecture
+  How to get better performance?
+    Primary-back replication using higher-level replicated state machines
+      key/value operations such as put and get
+
+  
+----
+
+VMware KB (#1013428) talks about multi-CPU support.  VM-FT may have switched
+from a replicated state machine approach to the state transfer approach, but
+unclear whether that is true or not.
+
+http://www.wooditwork.com/2014/08/26/whats-new-vsphere-6-0-fault-tolerance/
+http://www.tomsitpro.com/articles/vmware-vsphere-6-fault-tolerance-multi-cpu,1-2439.html
