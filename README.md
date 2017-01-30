@@ -9,3 +9,4 @@ MIT课程《Distributed Systems 》学习和翻译
 + [《分布式系统原理介绍》](http://pan.baidu.com/s/1geU1XAz)
 + [awesome-distributed-systems](https://github.com/kevinxhuang/awesome-distributed-systems)
 + [一名分布式存储工程师的技能树是怎样的？](https://www.zhihu.com/question/43687427/answer/96306564)
++ [袖珍分布式系统](http://www.jianshu.com/c/0cf64976a481)
