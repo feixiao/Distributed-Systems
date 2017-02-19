@@ -59,8 +59,8 @@ import "time"
 
 // RPC请求消息
 type reqMsg struct {
-	endname  interface{}  // name of sending ClientEnd
-	svcMeth  string       // e.g. "Raft.AppendEntries"
+	endname  interface{}  	// name of sending ClientEnd
+	svcMeth  string       	// e.g. "Raft.AppendEntries"
 	argsType reflect.Type 	// 参数类型
 	args     []byte     	// 请求参数
 	replyCh  chan replyMsg  // 接收回复的通道
@@ -114,24 +114,25 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 // 网络结构:模拟网络,记录一些网络上面的连接信息
 type Network struct {
 	mu             sync.Mutex
-	reliable       bool
+	reliable       bool		           // 标记网络是否可靠
 	longDelays     bool                        // pause a long time on send on disabled connection
-	longReordering bool                        // sometimes delay replies a long time
+	longReordering bool                        // 随机的延迟回复
 	ends           map[interface{}]*ClientEnd  // ends, by name
-	enabled        map[interface{}]bool        // by end name
-	servers        map[interface{}]*Server     // servers, by name
-	connections    map[interface{}]interface{} // endname -> servername
+	enabled        map[interface{}]bool        // 判断是否还在存活在这个此网络上
+	servers        map[interface{}]*Server     // servers, by name （管理这个网络上面的全部服务器程序）
+	connections    map[interface{}]interface{} // endname -> servername（客户端和服务器端的连接关系）
 	endCh          chan reqMsg
 }
 
+// 创造模拟网络对象
 func MakeNetwork() *Network {
 	rn := &Network{}
-	rn.reliable = true
-	rn.ends = map[interface{}]*ClientEnd{}
-	rn.enabled = map[interface{}]bool{}
-	rn.servers = map[interface{}]*Server{}
-	rn.connections = map[interface{}](interface{}){}
-	rn.endCh = make(chan reqMsg)
+	rn.reliable = true					// 默认网络是可靠的，不可靠只是在发生回应的时候随机延迟一段时间和随机放弃请求包
+	rn.ends = map[interface{}]*ClientEnd{}			// 存在于这个网络的端点
+	rn.enabled = map[interface{}]bool{}			// by end name ???
+	rn.servers = map[interface{}]*Server{}			// servers, by name ??
+	rn.connections = map[interface{}](interface{}){}	// 客户端和服务端之间的连接关系
+	rn.endCh = make(chan reqMsg)				//
 
 	// single goroutine to handle all ClientEnd.Call()s
 	go func() {
@@ -154,14 +155,14 @@ func (rn *Network) LongReordering(yes bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.longReordering = yes
+	rn.longReordering = yes	// sometimes delay replies a long time
 }
 
 func (rn *Network) LongDelays(yes bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.longDelays = yes
+	rn.longDelays = yes	// pause a long time on send on disabled connection
 }
 
 // 通过名字获取到配置信息
@@ -181,7 +182,7 @@ func (rn *Network) ReadEndnameInfo(endname interface{}) (enabled bool,
 	return
 }
 
-// 通过检索Network中的网络信息确定服务器是否还活着
+// 通过检索Network中的网络信息确定名字为endname的服务器是否还活着
 func (rn *Network) IsServerDead(endname interface{}, servername interface{}, server *Server) bool {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -192,7 +193,7 @@ func (rn *Network) IsServerDead(endname interface{}, servername interface{}, ser
 	return false
 }
 
-// 处理ClientEnd.Call(),在一个单独的goroutine中处理
+// 处理ClientEnd.Call(),每一个Call都在一个单独的goroutine中处理
 func (rn *Network) ProcessReq(req reqMsg) {
 	enabled, servername, server, reliable, longreordering := rn.ReadEndnameInfo(req.endname)
 
@@ -227,9 +228,9 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		serverDead := false
 		for replyOK == false && serverDead == false {
 			select {
-			case reply = <-ech:
+			case reply = <-ech:		// 等待server.dispatch返回结果
 				replyOK = true
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(100 * time.Millisecond):	// 等待超时
 				serverDead = rn.IsServerDead(req.endname, servername, server)
 			}
 		}
@@ -240,6 +241,10 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		// to an Append, but the server persisted the update
 		// into the old Persister. config.go is careful to call
 		// DeleteServer() before superseding the Persister.
+		//
+		// 如果DeleteServer()被调用就不响应回复，比如服务器已经被杀死。
+		// 这是为了避免这样的一个情况：客户端获得对Append的肯定回复，但服务器持久更新进入老persister。 ？？？
+		// config.go会很小心的在取代Persister之前调用DeleteServer()。
 		serverDead = rn.IsServerDead(req.endname, servername, server)
 
 		if replyOK == false || serverDead == true {
@@ -258,6 +263,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		}
 	} else {
 		// simulate no reply and eventual timeout.
+		// 模拟没有回复和最终超时。
 		ms := 0
 		if rn.longDelays {
 			// let Raft tests check that leader doesn't send
@@ -276,6 +282,7 @@ func (rn *Network) ProcessReq(req reqMsg) {
 
 // create a client end-point.
 // start the thread that listens and delivers.
+// 创建一个客户端,开启“线程”监听和分发
 func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -286,7 +293,7 @@ func (rn *Network) MakeEnd(endname interface{}) *ClientEnd {
 
 	e := &ClientEnd{}
 	e.endname = endname
-	e.ch = rn.endCh
+	e.ch = rn.endCh  	// 通过向e.ch发送消息就是往网络上面发送信息
 	rn.ends[endname] = e
 	rn.enabled[endname] = false
 	rn.connections[endname] = nil
@@ -298,23 +305,24 @@ func (rn *Network) AddServer(servername interface{}, rs *Server) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.servers[servername] = rs
+	rn.servers[servername] = rs  	// 添加服务器
 }
 
 func (rn *Network) DeleteServer(servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.servers[servername] = nil
+	rn.servers[servername] = nil	// 删除服务器
 }
 
 // connect a ClientEnd to a server.
 // a ClientEnd can only be connected once in its lifetime.
+// 客户端连接到服务器，客户端在自己的一个生命周期内只能连接一次
 func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.connections[endname] = servername
+	rn.connections[endname] = servername	// key：客户端，value：服务器端
 }
 
 // enable/disable a ClientEnd.
@@ -322,10 +330,11 @@ func (rn *Network) Enable(endname interface{}, enabled bool) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
 
-	rn.enabled[endname] = enabled
+	rn.enabled[endname] = enabled		// 使客户端存活或者消失在这个此网络上
 }
 
 // get a server's count of incoming RPCs.
+// 通过名字获取到Server，然后获取到rpc请求数量
 func (rn *Network) GetCount(servername interface{}) int {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -339,10 +348,12 @@ func (rn *Network) GetCount(servername interface{}) int {
 // the same rpc dispatcher. so that e.g. both a Raft
 // and a k/v server can listen to the same rpc endpoint.
 //
+// server是一系列服务器的集合，全部服务共享这同一个rpc分发器（rpc dispatcher）。
+// 这样Raft和键值服务都可以监听同一个rpc端点。
 type Server struct {
 	mu       sync.Mutex
-	services map[string]*Service
-	count    int // incoming RPCs
+	services map[string]*Service 		// 这个Server下面提供的全部服务
+	count    int 				// 进入的rpc请求数量
 }
 
 func MakeServer() *Server {
@@ -363,21 +374,24 @@ func (rs *Server) dispatch(req reqMsg) replyMsg {
 	rs.count += 1
 
 	// split Raft.AppendEntries into service and method
+	// 分离服务名字和方法
 	dot := strings.LastIndex(req.svcMeth, ".")
 	serviceName := req.svcMeth[:dot]
 	methodName := req.svcMeth[dot+1:]
 
+	// 通过服务方法需要服务
 	service, ok := rs.services[serviceName]
 
 	rs.mu.Unlock()
 
 	if ok {
-		return service.dispatch(methodName, req)
+		return service.dispatch(methodName, req)	// 存在就调用服务处理
 	} else {
 		choices := []string{}
 		for k, _ := range rs.services {
 			choices = append(choices, k)
 		}
+		// log输出全部的服务名字，还有不支持的服务（现在的请求）
 		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
 			serviceName, serviceName, methodName, choices)
 		return replyMsg{false, nil}
@@ -392,11 +406,12 @@ func (rs *Server) GetCount() int {
 
 // an object with methods that can be called via RPC.
 // a single server may have more than one Service.
+// 带有方法的对象，可以通过rpc被调用，一个Server可以含有不知一个服务(Service)
 type Service struct {
-	name    string
-	rcvr    reflect.Value
-	typ     reflect.Type
-	methods map[string]reflect.Method
+	name    string				// 服务的名字
+	rcvr    reflect.Value			//
+	typ     reflect.Type			//
+	methods map[string]reflect.Method       // 方法的名字和方法的对应关系
 }
 
 func MakeService(rcvr interface{}) *Service {
@@ -431,6 +446,7 @@ func MakeService(rcvr interface{}) *Service {
 }
 
 func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
+	//  根据方法名字，查找方法
 	if method, ok := svc.methods[methname]; ok {
 		// prepare space into which to read the argument.
 		// the Value's type will be a pointer to req.argsType.
