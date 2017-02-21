@@ -10,7 +10,7 @@ package raft
 // 我们使用最初的config.go文件分级测试你们的代码,所以你们可与修改这边的代码帮助你们调试，
 // 请在提交之前测试。
 
-import "labrpc"
+import "../labrpc"
 import "log"
 import "sync"
 import "testing"
@@ -29,20 +29,23 @@ func randstring(n int) string {
 	return s[0:n]
 }
 
+// 构建测试环境对象
 type config struct {
 	mu        sync.Mutex
 	t         *testing.T
-	net       *labrpc.Network
-	n         int
-	done      int32 // tell internal threads to die
-	rafts     []*Raft
-	applyErr  []string // from apply channel readers
-	connected []bool   // whether each server is on the net
-	saved     []*Persister
-	endnames  [][]string    // the port file names each sends to
-	logs      []map[int]int // copy of each server's committed entries
+	net       *labrpc.Network 	// 模拟网络
+	n         int			// 服务器的数量
+	done      int32 		// tell internal threads to die
+	// 下面slice的长度都为n
+	rafts     []*Raft		// 管理主机实例,数量为n
+	applyErr  []string 		// from apply channel readers
+	connected []bool   		// whether each server is on the net
+	saved     []*Persister		// 数据持久化：Raft状态值和快照数据
+	endnames  [][]string   		// the port file names each sends to
+	logs      []map[int]int 	// copy of each server's committed entries,每台服务器的日志副本
 }
 
+// 构建测试环境
 func make_config(t *testing.T, n int, unreliable bool) *config {
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
@@ -56,17 +59,19 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	cfg.endnames = make([][]string, cfg.n)
 	cfg.logs = make([]map[int]int, cfg.n)
 
-	cfg.setunreliable(unreliable)
+	cfg.setunreliable(unreliable)	// 设置网络为不可靠网络
 
-	cfg.net.LongDelays(true)
+	cfg.net.LongDelays(true)	// 存在长延时的网络
 
 	// create a full set of Rafts.
+	// 创建raft集合(为什么是 cfg.n × cfg.n 个端点)
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]int{}
 		cfg.start1(i)
 	}
 
 	// connect everyone
+	// 连接每一个raft实例
 	for i := 0; i < cfg.n; i++ {
 		cfg.connect(i)
 	}
@@ -112,20 +117,25 @@ func (cfg *config) crash1(i int) {
 // state persister, to isolate previous instance of
 // this server. since we cannot really kill it.
 //
+// 启动或者重新启动一个Raft实例,如果实例已经存在那么我们下“杀死”（译注：应该只是隔离，重新启动一个新的raft实例）。
+// 重新分配一个新的输出端口的文件名(???)和一个新的状态持久化对象，为了隔离之前本机的服务器实例。
+// 因为我们不能杀死它。
 func (cfg *config) start1(i int) {
 	cfg.crash1(i)
 
 	// a fresh set of outgoing ClientEnd names.
 	// so that old crashed instance's ClientEnds can't send.
+	// 一套新鲜的对外ClientEnd名字，所以旧的崩溃实例ClientEnds不能发送。
 	cfg.endnames[i] = make([]string, cfg.n)
 	for j := 0; j < cfg.n; j++ {
-		cfg.endnames[i][j] = randstring(20)
+		cfg.endnames[i][j] = randstring(20) // 随机产生的名字,这边产生 cfg.n个名字？？？
 	}
 
 	// a fresh set of ClientEnds.
+	// 新鲜的ClientEnds集合
 	ends := make([]*labrpc.ClientEnd, cfg.n)
 	for j := 0; j < cfg.n; j++ {
-		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
+		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j]) 	// 创建名为cfg.endnames[i][j]的ClientEnd
 		cfg.net.Connect(cfg.endnames[i][j], j)
 	}
 
@@ -135,6 +145,7 @@ func (cfg *config) start1(i int) {
 	// new instance's persisted state.
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
+	// 一个新的持久化对象，
 	if cfg.saved[i] != nil {
 		cfg.saved[i] = cfg.saved[i].Copy()
 	} else {
@@ -144,6 +155,7 @@ func (cfg *config) start1(i int) {
 	cfg.mu.Unlock()
 
 	// listen to messages from Raft indicating newly committed messages.
+	// 创建channel处理消息
 	applyCh := make(chan ApplyMsg)
 	go func() {
 		for m := range applyCh {
@@ -152,6 +164,7 @@ func (cfg *config) start1(i int) {
 				// ignore the snapshot
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
+				// 日志处理
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
 						// some server has already committed a different value for this entry!
@@ -179,12 +192,15 @@ func (cfg *config) start1(i int) {
 		}
 	}()
 
+	// 创建Raft实例
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 
+	// 记录自己的位置
 	cfg.mu.Lock()
 	cfg.rafts[i] = rf
 	cfg.mu.Unlock()
 
+	// 创建提供Raft相关方法的实例，添加到本网络
 	svc := labrpc.MakeService(rf)
 	srv := labrpc.MakeServer()
 	srv.AddService(svc)
@@ -207,14 +223,20 @@ func (cfg *config) connect(i int) {
 	cfg.connected[i] = true
 
 	// outgoing ClientEnds
+	// 	1	0	0
+	//	1	1	0
+	// 	1	1	1
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[i][j]
-			cfg.net.Enable(endname, true)
+			cfg.net.Enable(endname, true)	// 之前创建的端点存在于此网络
 		}
 	}
 
 	// incoming ClientEnds
+	// 	1	1	1
+	//	1	1	1
+	// 	1	1	1
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[j][i]
