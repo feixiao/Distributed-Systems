@@ -51,6 +51,12 @@ func (js *JunkServer) Handler5(args JunkArgs, reply *JunkReply) {
 	reply.X = "no pointer"
 }
 
+//	add by frank
+//	export GOPATH=/home/frank/workspace/Distributed-Systems/6.824
+//	cd ${GOPATH}/src/labrpc
+//      go test -v
+//      go test -v -run  TestBasic		// 测试单个函数
+
 func TestBasic(t *testing.T) {
 	runtime.GOMAXPROCS(4)
 
