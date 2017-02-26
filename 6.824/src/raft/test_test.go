@@ -17,11 +17,15 @@ import "sync"
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
+
+// 这个测试慷慨地允许解决方案在一秒钟完成选举（比论文中的超时范围多了很多）
+// 译注： 论文中的选举超时时间可能需要在 10 毫秒到 500 毫秒之间
 const RaftElectionTimeout = 1000 * time.Millisecond
 
+// go test -v  -run TestInitialElection
 func TestInitialElection(t *testing.T) {
 	servers := 3
-	cfg := make_config(t, servers, false)
+	cfg := make_config(t, servers, false) // servers是实例数量,false为不可靠网络
 	defer cfg.cleanup()
 
 	fmt.Printf("Test: initial election ...\n")

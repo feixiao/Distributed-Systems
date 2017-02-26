@@ -10,7 +10,7 @@ package raft
 // 我们使用最初的config.go文件分级测试你们的代码,所以你们可与修改这边的代码帮助你们调试，
 // 请在提交之前测试。
 
-import "../labrpc"
+import "labrpc"
 import "log"
 import "sync"
 import "testing"
@@ -50,10 +50,10 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
-	cfg.net = labrpc.MakeNetwork()
+	cfg.net = labrpc.MakeNetwork()		// 构建测试网络
 	cfg.n = n
 	cfg.applyErr = make([]string, cfg.n)
-	cfg.rafts = make([]*Raft, cfg.n)
+	cfg.rafts = make([]*Raft, cfg.n)	//  构建cfg.n个Raft实例
 	cfg.connected = make([]bool, cfg.n)
 	cfg.saved = make([]*Persister, cfg.n)
 	cfg.endnames = make([][]string, cfg.n)
@@ -64,10 +64,10 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	cfg.net.LongDelays(true)	// 存在长延时的网络
 
 	// create a full set of Rafts.
-	// 创建raft集合(为什么是 cfg.n × cfg.n 个端点)
+	// 创建raft集合(cfg.n × cfg.n个端点，因为需要互相连接),cfg.n个Raft实例
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]int{}
-		cfg.start1(i)
+		cfg.start1(i)	// 构建节点之间的相互连接关系
 	}
 
 	// connect everyone
@@ -128,7 +128,7 @@ func (cfg *config) start1(i int) {
 	// 一套新鲜的对外ClientEnd名字，所以旧的崩溃实例ClientEnds不能发送。
 	cfg.endnames[i] = make([]string, cfg.n)
 	for j := 0; j < cfg.n; j++ {
-		cfg.endnames[i][j] = randstring(20) // 随机产生的名字,这边产生 cfg.n个名字？？？
+		cfg.endnames[i][j] = randstring(20) // 随机产生的名字,这边产生 cfg.n个名字(需要连接到其他的服务器，创建不同的端点)
 	}
 
 	// a fresh set of ClientEnds.
@@ -136,7 +136,11 @@ func (cfg *config) start1(i int) {
 	ends := make([]*labrpc.ClientEnd, cfg.n)
 	for j := 0; j < cfg.n; j++ {
 		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j]) 	// 创建名为cfg.endnames[i][j]的ClientEnd
-		cfg.net.Connect(cfg.endnames[i][j], j)
+		cfg.net.Connect(cfg.endnames[i][j], j)		// cfg.n个节点连接到j（在这边服务器是0,1,2）
+		// cfg.endnames[i][j]：索引j表示连接到的服务器，索引i为自身
+		// 0 : 0->0 0->1 0->2	00 01 02
+		// 1 : 1->0 1->1 1->2	10 11 12
+		// 2 : 2->0 2->1 2->2	20 21 22
 	}
 
 	cfg.mu.Lock()
@@ -165,6 +169,8 @@ func (cfg *config) start1(i int) {
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
 				// 日志处理
+
+				// 遍历全部的日志系列
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
 						// some server has already committed a different value for this entry!
@@ -172,10 +178,14 @@ func (cfg *config) start1(i int) {
 							m.Index, i, m.Command, j, old)
 					}
 				}
-				_, prevok := cfg.logs[i][m.Index-1]
+
+				// 添加日志
+				_, prevok := cfg.logs[i][m.Index-1] // map中是否存在key：m.Index-1
 				cfg.logs[i][m.Index] = v
 				cfg.mu.Unlock()
 
+				// 索引肯定是从开始，排除是一个情况
+				// 如果之前的不存在，那么这台服务上面的日志已经乱序
 				if m.Index > 1 && prevok == false {
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
 				}
@@ -217,26 +227,29 @@ func (cfg *config) cleanup() {
 }
 
 // attach server i to the net.
+// 使服务器在此网络上线
 func (cfg *config) connect(i int) {
 	// fmt.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
+	// func (cfg *config) start1(i int)构建的连接关系
+	// cfg.endnames[i][j]：索引j表示连接到的服务器，索引i为自身
+	// 0 : 0->0 0->1 0->2	00 01 02
+	// 1 : 1->0 1->1 1->2	10 11 12
+	// 2 : 2->0 2->1 2->2	20 21 22
+
 	// outgoing ClientEnds
-	// 	1	0	0
-	//	1	1	0
-	// 	1	1	1
+	// cfg.endnames[i][j] 是主动连接上来的，所以是outgoing ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[i][j]
-			cfg.net.Enable(endname, true)	// 之前创建的端点存在于此网络
+			cfg.net.Enable(endname, true)	// 使连接到这个服务器的客户端上线
 		}
 	}
 
 	// incoming ClientEnds
-	// 	1	1	1
-	//	1	1	1
-	// 	1	1	1
+	// cfg.endnames[j][i] 是被动连接， 所以是incoming ClientEnds
 	for j := 0; j < cfg.n; j++ {
 		if cfg.connected[j] {
 			endname := cfg.endnames[j][i]
@@ -282,22 +295,25 @@ func (cfg *config) setlongreordering(longrel bool) {
 
 // check that there's exactly one leader.
 // try a few times in case re-elections are needed.
+// 检测是否存在领导者， 尝试几次，以便需要重新选举。
 func (cfg *config) checkOneLeader() int {
 	for iters := 0; iters < 10; iters++ {
 		time.Sleep(500 * time.Millisecond)
-		leaders := make(map[int][]int)
+
+		leaders := make(map[int][]int)	// key:currentTerm, value: 切片类型(Raft实例的索引)
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
 				if t, leader := cfg.rafts[i].GetState(); leader {
-					leaders[t] = append(leaders[t], i)
+					leaders[t] = append(leaders[t], i)   // 把含有相同的currentTerm的Raft实例归在一起？
 				}
 			}
 		}
 
 		lastTermWithLeader := -1
-		for t, leaders := range leaders {
-			if len(leaders) > 1 {
-				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(leaders))
+		//for t, leaders := range leaders {
+		for t, lds := range leaders {
+			if len(lds) > 1 {
+				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(lds))
 			}
 			if t > lastTermWithLeader {
 				lastTermWithLeader = t
@@ -305,7 +321,7 @@ func (cfg *config) checkOneLeader() int {
 		}
 
 		if len(leaders) != 0 {
-			return leaders[lastTermWithLeader][0]
+			return leaders[lastTermWithLeader][0]  // 找到领导者，并返回领导者索引
 		}
 	}
 	cfg.t.Fatalf("expected one leader, got none")
