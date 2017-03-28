@@ -67,7 +67,7 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	// 创建raft集合(cfg.n × cfg.n个端点，因为需要互相连接),cfg.n个Raft实例
 	for i := 0; i < cfg.n; i++ {
 		cfg.logs[i] = map[int]int{}
-		cfg.start1(i)	// 构建节点之间的相互连接关系
+		cfg.start1(i)	// 构建节点之间的相互连接关系（创建Raft实例）
 	}
 
 	// connect everyone
@@ -166,6 +166,7 @@ func (cfg *config) start1(i int) {
 			err_msg := ""
 			if m.UseSnapshot {
 				// ignore the snapshot
+				// 忽略快照
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
 				// 日志处理
@@ -202,7 +203,7 @@ func (cfg *config) start1(i int) {
 		}
 	}()
 
-	// 创建Raft实例
+	// 创建Raft实例,启动心跳准备超时进行选举
 	rf := Make(ends, i, cfg.saved[i], applyCh)
 
 	// 记录自己的位置
@@ -304,13 +305,12 @@ func (cfg *config) checkOneLeader() int {
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
 				if t, leader := cfg.rafts[i].GetState(); leader {
-					leaders[t] = append(leaders[t], i)   // 把含有相同的currentTerm的Raft实例归在一起？
+					leaders[t] = append(leaders[t], i)   // 获取领导者个数
 				}
 			}
 		}
 
 		lastTermWithLeader := -1
-		//for t, leaders := range leaders {
 		for t, lds := range leaders {
 			if len(lds) > 1 {
 				cfg.t.Fatalf("term %d has %d (>1) leaders", t, len(lds))
