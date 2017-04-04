@@ -1,0 +1,341 @@
+6.824 2016 Lecture 17: Existential Consistency
+
+why are we reading this paper?
+  practical storage for giant read-heavy web sites (again)
+  technique to detect anomalies
+  practical consistency concerns
+
+review of overall FB architecture
+  each region has a full DB replica
+    sharded across MySQL servers
+    for each data item, one region (thus one DB server) is the master
+      master DB updates slave DBs in other regions
+  each region has lots of Front Ends (FEs)
+    web servers, with web site logic in e.g. Python or PHP
+  each region has lots of caches
+    a region's caches are divided into independent clusters
+    each cluster shards the data over its caches
+    FE reads first try cache; use DB if cache miss
+  each FE usually talks to just one cluster (in its region)
+  
+why this overall arrangement?
+  why multiple geographic sites (regions)?
+    low network delay to users
+  why a complete replica in DBs for each region?
+    so all reads can be local
+  why DB servers specifically?
+    persistence, transactional writes
+  why sharded DB servers?
+    far too big and too much write load for one DB server
+  why caches (why not just lots of DB servers, small shards)?
+    caches have much higher throughput than DBs for reads
+    i.e. higher throughput for a given # of machines
+  why multiple cache clusters per region?
+    each cluster has a copy of each item, can serve in parallel
+      helps with popular items
+  why shard across cache servers in each cluster?
+    limited # of copies of each item, to reduce RAM use
+    limited # of places to send invalidates after write
+
+early FB "look-aside" caching
+  memcached cache servers (mc)
+  driven by FEs; mc and DB not aware of each other
+  many web sites are structured like this!
+  read(k)
+    v = mc-get(k)
+    if v = nil
+      v = fetch from local DB
+      mc-set(k, v)
+    return v
+  write(k, v)
+    send k,v to master DB
+    mc-delete(k)
+    asynchronously (write doesn't wait):
+      master DB sends to slave DBs
+      all DBs send invalidates to caches
+
+it was hard for FB to get look-aside caching right:
+  * miss/write race
+    entire write (incl delete) might occur between a read()'s
+      DB fetch and mc-set()
+    leaving memcache with *permanent* stale data
+    users will eventually notice missing update
+  * read-after-write anomaly
+    C1 sends write to DB master in remote region
+    same user reads same key; miss in memcache; read from local DB
+      local DB hasn't seen update
+    users may immediately notice that read doesn't see prior write!
+  * thundering herd
+
+cause of these problems:
+  no entity is aware of -- and ordering -- the concurrent operations on each key
+
+these problems motivated a new design (TAO) as well as the desire
+  to systematically monitor correctness.
+
+FB's new system: TAO (Figure 1)
+  FEs send reads/writes *through* caches -- not look-aside
+  2nd layer of "root" caches
+    one root cache per shard per region
+    root cache orders accesses to each key -- one op at a time
+  read:
+    "leaf" cache for key's shard in FE's cluster checks
+      on miss, forwards to root cache for the key's shard
+    root cache also checks, forwards read to DB on miss
+  write:
+    leaf, root, root in master region, db in master region, and back
+      leaf/root caches update on the way back
+    async:
+      master DB replicates log to slave DBs in other regions
+      DBs send invalidates
+
+how does TAO fix look-aside problems?
+  * miss/write race:
+    root cache processes one op at a time
+    delays write until read completely done
+  * read-after-write anomaly:
+    caches install new value (from master DB) before returning from write
+    FE won't issue subsequent read until write finishes
+  * thundering herd:
+    each cache is aware of all requests for a key, and can limit
+    to one outstanding miss per key, and can rate-limit all misses across keys.
+
+TAO consistency model
+  paper says:
+    per-object sequential consistency within a cache
+    read-after-write consistency within a cache
+    eventual consistency between caches
+  why per-object seq c?
+    close to PNUTS timeline consistency
+    allows cached values to lag (e.g. due to slow invalidates)
+    but ensures users don't see values go *backwards*
+    so viewers don't see information appear, then disappear
+    also part of eventual consistency
+      ensures agreement abt which write comes last
+  why read-after-write?
+    really "see your own writes"
+    violations would be plainly visible to users
+  what is "within a cache"?
+    guaranteed only if FE uses a single cluster
+    if cluster fails and FE switches, no guarantee
+
+this is a weak consistency model
+  allows stale reads from caches (until invalidate arrives)
+  what would a linearizable design look like?
+    single copy of each key, writes+reads all go to master DB?
+      like PNUTS read-latest
+    caching, but write must *wait* for all invalidates to complete?
+  what would the cost be?
+    either much slower reads, or much slower writes
+  linearizability costs you on every operation
+    but may only make a difference in smallish window after each write
+
+why do they want a consistency checker?
+  they *want* linearizability but would prefer not to pay for it
+  so they want to know how far short TAO falls in practice
+  so they check against linearizability, as well as against actual guarantees
+  they also want a systematic way to watch for the
+    kind of bugs that the look-aside cache had
+
+what is linearizability?
+  there exists a total order of all operations,
+    that matches real-time (for non-overlapping ops), and
+    in which each read sees most recent preceding write.
+  example:
+    |--Wx1--| |-Wx2-|
+       |------Rx2-------|
+                |-Rx1-|
+    order: Wx1 Rx1 Wx2 Rx2
+      obeys real-time rule -- only constrains Wx1->Wx2 and Wx1->Rx1
+      obeys value rule
+
+checking linearizability is tricky
+  if writes and reads overlap
+  in above example, either read could have returned either value
+    multiple outcomes are often legal if concurrency
+  but a strictly subsequent read *must* return 2
+    since Wx2 strictly later than Wx1
+  difficult to check concurrent ops even in controlled tests, like Lab 3
+  they want to check using passive observations!
+
+linearizability is a "local model"
+  can spot violations by looking at traces of individual keys
+  no need to consider multi-key traces, or per-FE traces
+
+how do they check linearizability?
+  pick a (tiny) random subset of objects (keys)
+  all FEs record all reads/writes on those keys
+  offline processing of trace at end of day
+
+what's in a trace entry?
+  key, read vs write, value hash, start time, end time, &c
+  Figure 4:
+    |--Wx1--|
+              |--Wx2--|
+                        |--Rx1--|
+
+they construct a graph for each key
+  each vertex is a read or write operation
+  Figure 4: Wx1 -> Wx2 -> Rx1
+    and Wx1 -> Rx1
+  edge for each time relationship
+    if op2's start time > op1's end time, edge from op1 to op2
+  edge for each value relationship
+    if op2 read op1's written value, edgie from op1 to op2
+  the edges are constraints on any total order
+    they reflect the two linearizability rules
+  loop -> no total order -> not linearizable
+  no loop -> can find a total order -> linearizable
+
+they merge each read into the write whose value it read
+  moving the read's edges to the write
+  Figure 4:
+    Wx1 --> Wx2
+        <--
+  (I do not fully understand the merging story.)
+  why is merging legal?
+    if the trace is linearizable, 
+    all of a write's reads must happen before (in time) the next write,
+    or be concurrent,
+    so the merge can't cause loops.
+  why is merging needed?
+    i think non-merged graph has loops only when a read
+      precedes the corresponding write
+    we want a graph with loops when a read doesn't see preceding write
+    perhaps merge converts to write/write edges:
+      an edge to each write seen by a read later in time
+      if no anomalies, these edges will all point forwards (no loops)
+      if anomalies, may point sideways (Figure 5) or backwards (Figure 4)
+
+Figure 4 has a cycle:
+  Wx1 precedes Wx2 in time
+  Wx1 follows Wx2 in value visibility
+  cycle -> no total order -> not linearizable
+  "stale read anomaly" -- Rx1 probably from stale cache
+    though this analysis doesn't do much to
+    tell you what the underlying bug is.
+
+Example: Figure 5
+  "total order anomaly"
+  when concurrent writes, either outcome is OK, but
+    subsequent reads have to agree!
+
+will this technique ever say "legal" to a non-linearizable execution?
+  yes, if incorrect clock says a stale read happened earlier than it did
+    Wx1 Wx2 Rx1
+  maybe, if Wx2 Wx1 Wx2 Rx2 but it saw stale earlier write (not really an error)
+  (and of course it says nothing about non-sampled keys)
+
+will this technique ever say "illegal" to a linearizable execution?
+  yes, if FE clocks disagree
+  for write/write or write/read or read/write order
+
+they also check per-obj seq consist and read-after-write
+  any violation of weaker models is also a violation of linearizability
+  so they just have to filter the linearizability anomalies
+  but I do not understand how they do it!
+
+why can't they check causal consistency?
+  (this is The Question)
+  this is legal under causal consistency:
+    C0: Wx1
+    C1:     Rx1
+    C2:         Rx0
+  this is illegal:
+    C0: Wx1
+    C1:     Rx1 Wy2
+    C2:             Ry2 Rx0
+  that is, if C2 sees write to y, it should also see all
+    writes that could have caused that write to y.
+  can we distinguish these using just an x trace, or just a y trace?
+  the y trace alone looks OK in the illegal trace:
+    Wy2 Ry2
+    so the y trace alone isn't enough to spot illegal executions
+  the x trace is the SAME for both the legal and illegal traces:
+    Wx1 Rx1 Rx0
+    so the x trace alone isn't enough to spot illegal executions
+  since they only trace a tiny random sample of keys,
+    they are unlikely to see both x and y, so they cannot
+    check causal consistency.
+
+why is linearizability a local model?
+  i.e. why can we check it with just a small sample of keys?
+  let's look at a classic multi-key situation
+    initialization: x=0 y=0
+    T0:            T1:
+    y=1            x=1
+    if x==0:       if y==0:
+      print "y"      print "x"
+  we had better not see both prints!
+
+an execution that's correct under linearizability:
+          Wy1  Rx1 
+Wx0 Wy0
+          Wx1  Ry1
+trace of just x:
+  Wx0 Wx1 Rx1
+  checker sees no anomalies
+
+an execution that's incorrect under linearizability:
+          Wy1  Rx0 
+Wx0 Wy0
+          Wx1  Ry0
+trace of just x:
+  Wx0 Wx1 Rx0
+  draw "T" and "V" arrows for x
+  checker sees a stale read anomaly
+what if Rx0 started before Wx1 ended?
+  then x trace is legal
+  but in that situation real-time requires Ry0 to be after Wy1,
+    so y's trace will show a stale read anomaly.
+
+measurement results -- Table 3
+  I'd expect many linearizability anomalies, from stale caches.
+    since TAO implements a relaxed consistency model
+  the big surprise is that there are so few!
+    only 0.004% of reads show linearizability anomalies
+    few writes (1 in 450)
+    locality (consistency better within writer's cache)
+    fast invalidation messages
+
+what do the results mean?
+  does 0.0004% suggest no need to implement linearizability?
+    since in practice would rarely make any difference?
+  is 0.0004% good or bad?
+    for comments on pictures?
+    for latest bid in an eBay auction?
+    for a password change?
+  what about:
+    for counting ad impressions for paying ad customers?
+    bank transfers?
+    this paper is *not* about transactions!
+  how do they think about consistency?
+    not "correct vs incorrect"
+      not a contract with programmer that must be fulfilled
+    seems to be nothing special for them about any given model
+      i.e. not "our system works if storage is per-obj seq consistent,
+        but breaks if it isn't"
+    their real goal is closer to freshness
+      they want to minimize "vulnerability window" in which
+        reads miss the latest write
+      in order to minimize user complaints
+      still, users can tolerate stale data, often won't notice
+  what about ease of programming?
+    is there anything here that would make programming easier?
+    application code has to defend against anomalies
+      e.g. comment appears before commented-on picture
+  how generalizable are their results?
+    to other storage systems or applications?
+    most relevant to user-oriented systems with no hard requirements
+    0.0004% depends deeply on read-heavy, locality, and fast invalidation
+
+conclusion
+  low-cost checking technique
+  low-consistency design can provide remarkably high consistency!
+    i.e. they rarely display stale data to the user
+    sheds doubt on need for costly consistent designs
+  consistency not always a correctness question
+    for them, about freshness of information shown to user
+    *not* about correct/incorrect or inter-module contracts
+  results are Facebook-specific
+    but perhaps they are representative of many web sites

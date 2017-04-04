@@ -1,0 +1,371 @@
+6.824 2016 Lecture 11: FaRM
+
+why are we reading this paper?
+  distributed transactions tradionally seen as slow
+  this paper suggests that needn't be true -- very surprising performance!
+  how do they do it?
+
+big performance picture
+  90 million *replicated* *persistent* *transactions* per second (Figure 7)
+    1 million transactions/second per machine
+    each with a few messages, for replication and commit
+    very impressive
+  a few other systems get 1 million ops/second per machine, e.g. memcached
+    but not transactions + replicated + persistent (often not any of these!)
+    and you really want all of them in many situations
+  perspective on 90 million:
+    10,000 Tweets per second
+    2,000,000 e-mails per second
+
+how do they get high performance?
+  data must fit in total RAM (so no disk reads)
+  non-volatile RAM (so no disk writes)
+  fast net
+  efficient CPU use, mostly related to network
+  a meta-point: you need to fix all; fixing one just leaves you limited by others
+
+FaRM writes go to RAM, not disk -- eliminates a huge bottleneck
+  can write RAM in 200 ns, but takes 10 ms to write hard drive, 100 us for SSD
+    ns = nanosecond, ms = millisecond, us = microsecond
+  but RAM loses content in power failure! not persistent by itself.
+  why not just write to RAM of f machines, to tolerate f failures?
+    might be enough if failures were always independent
+    but power failure is not independent -- may strike 100% of machines!
+    also faster to re-incorporate rebooted machines if they still have pre-crash data.
+  so:
+    batteries power the machines for a while if main power fails
+    s/w knows when main power fails
+    s/w halts all transaction processing
+    s/w writes FaRM's RAM to SSD; may take a few minutes
+    then machine shuts down cleanly
+    on re-start, FaRM reads saved memory image from SSD
+    "non-volatile RAM"
+  what if crash prevents s/w from writing SSD?
+    e.g kernel bug, or cpu/memory/hardware error
+    hopefully such crashes are independent
+    so that that <= f of our f+1 replicas die
+
+why is the network a performance bottleneck?
+  the usual setup:
+    app on S1 wants to send data to app on S2
+    write() system call
+    copy to kernel buffers
+    kernel protocol s/w e.g. TCP
+    kernel gives to NIC
+    NIC sends in packets to S2's NIC
+    S2 NIC DMAs into memory
+    interrupt
+    kernel TCP code
+    read() system call
+    copy to user memory
+  it's a complex and slow story!
+    hard to build RPC than can deliver more than a few 100,000 / second
+      labrpc takes 20 microseconds per RPC -- 50,000 / second
+      and it doesn't use the network!
+    wire b/w (e.g. 10 gigabits/second) is rarely the limit for short RPC
+    these per-packet CPU costs are the limiting factor for small messages
+  
+FaRM's network setup
+  NIC does "one-sided RDMA": memory read/write, not packet delivery
+  sender says "write this data at this address", or "read this address"
+    NIC *hardware* executes at the far end
+    returns a "hardware acknowledgement"
+  no interrupt, kernel, copy, read(), &c at the far end
+  one server's throughput: 10+ million/second (Figure 2)
+  latency: 5 microseconds (from their NSDI 2014 paper)
+  Q: how could throughput != 1/latency ?
+  FaRM uses RDMA in three ways:
+    one-sided read of objects by executing transactions (also VALIDATE)
+    one-sided write into backup's log
+    RPC composed of one-sided writes to primary's logs or message queues
+  one-sided RMDA is so fast that FaRM doesn't bother caching objects in clients
+
+application access to NIC h/w is streamlined
+  application directly interacts with NIC -- no system calls, no kernel
+  sender gives NIC an RDMA command
+  receiver polls memory into which RDMA will deposit messages / log entries
+  polling vs interrupting
+    polling requires careful interleaving of code
+    polling more efficient at high load
+    interrupting more efficient at low load
+  this all makes sense if machine is dedicated to FaRM
+    but traditional kernel scheme perhaps better if many applications
+    want to share a NIC.
+
+idealized API -- how we'd like transaction code to look:
+  begin()
+  o = get(oid)
+  o.f += 1
+  put(oid, o)
+  ok = commit()
+
+why FaRM doesn't look quite like this
+  one has to run many xactions in parallel to keep system busy
+  for above style (blocking get()) you need threads -- many of them
+    but thread switches are slow -- a few microseconds
+  RDMA takes only 5 microseconds, so FaRM needs to switch among
+    transactions much faster than that
+
+actual API (from NSDI 2014 paper)
+  f1()
+    tx = create()
+    txRead(tx, oid, f2)
+  f2(tx, o)
+    txWrite(tx, oid, o, o1)
+    o1.f += 1
+    txCommit(tx, f4)
+  f4(tx, ok)
+    ...
+  "event-driven"
+  these functions internally register the callback, then poll for
+    input, then call the callback registered to deal w/ input
+  letting a transaction run involves only a function call,
+    not a thread switch -- much faster
+  it's an awkward model
+  could probably be helped w/ better language support
+  but traditional convenient abstractions (threads,
+    blocking calls, kernel, interrupts) are not always compatible
+    with very high performance.
+
+thus each core interleaves multiple activities, all at user level:
+  loop:
+    poll incoming msg/log RDMA queues for input
+    call appropriate transaction's callback
+      transaction executes until next API call
+      API call sends, remembers callback
+    or do server processing on a new log entry
+
+what's in an oid?
+  <region #, offset>
+  region # indexes a mapping to primary server
+  offset is a memory address in that server's memory
+  simple enough that sender can calculate an address for RDMA
+    so target CPU doesn't have to be involved in reads
+
+server memory layout
+  regions, each an array of objects
+  object layout
+    header with version # and lock
+    version # repeated in each cache line
+  for each other server
+    (written by RDMA, read by polling)
+    incoming log
+    incoming message queue
+  all this in non-volatile RAM (i.e. written to SSD on power failure)
+
+every region replicated on one primary, f backups -- f+1 replicas
+  [diagram of a few shards, primary/backup]
+  only the primary serves reads
+  replication yields availability if <= f failures
+  AND replication allows completion of commits despite failures
+
+let's talk about RaFT's transaction design
+  much of the detailed design motivated by desire to use one-sided RDMA
+  most critically:
+    uses OCC to allow one-sided data reads
+    pessimistic locking would require server CPU
+
+txRead
+  one-sided RDMA to fetch object direct from primary's memory -- fast!
+  what if primary is in the middle of updating the object?
+    version # per cache line
+    reader will see a mix to two version #s
+    reader re-tries RDMA until all version #s the same
+  can the read yield stale data?
+    after all, the reader is not caching
+    yes: read just before other xaction commits
+    then data is stale by the time our xaction commits
+
+txWrite
+  must be preceded by txRead
+  no communication
+  allocates local copy of object to hold modifications
+  lets txCommit knows what is in write set
+
+client acts as its own TC (transaction coordinator) during commit
+
+transaction execution / commit protocol w/o failure -- Figure 4 / Section 4
+  let's consider steps in Figure 4 one by one
+  thinking about concurrency control for now
+  very similar to two-phase commit!
+
+LOCK (first message in commit protocol)
+  TC sends to primary of each written object
+  TC uses RDMA to append to its log at each primary
+  LOCK record contains oid, version # we read, new value (plus other stuff)
+  primary polls log, sees LOCK entry, validates, sends "yes" or "no" reply message
+  TC waits for reply messages
+
+what does primary CPU do on receipt of LOCK?
+  (for each object)
+  if object locked, or version != what xaction read, reply "no"; TC will abort
+  otherwise set the lock flag and return "yes"
+  note: does *not* block if object is already locked -- instead, TC aborts
+
+TC waits for all LOCK reply messages
+  if any "no", abort (calls txCommit callback with "no")
+
+let's ignore VALIDATE and COMMIT BACKUP for now
+
+TC sends COMMIT-PRIMARY to primary of each written object
+  uses RDMA to append to primary's log
+  TC only waits for hardware ack -- does not wait for primary to process log entry
+  TC says "yes" to app (calls txCommit callback) as soon as first ack arrives
+    (ack rule so loss of f backups doesn't lose indication that VALIDATEs succeeded)
+
+what does primary do when it processes the COMMIT-PRIMARY in its log?
+  copy new value over object's memory
+  increment object's version #
+  clear object's lock flag
+
+example:
+  T1 and T2 both want to increment x
+  both say
+    tmp = read(x)
+    tmp += 1
+    write(x)
+  x should end up with 0, 1, or 2 depending on how many successfully committed
+
+what if T1 and T2 are exactly in step?
+  T1: Rx0  Lx  Cx
+  T2: Rx0  Lx  Cx
+  what will happen?
+
+or
+  T1:    Rx0 Lx Cx
+  T2: Rx0          Lx  Cx
+
+or
+  T1: Rx0  Lx   Cx
+  T2:        Rx?   Lx  Cx
+
+why do FaRM's locks and versions achieve serializability?
+  seems very different from Thor's timestamps and VQ
+    FaRM validation doesn't directly reason about other transactions at all!
+
+the exclusive locks force an order on conflicting transactions
+  so "earlier" and "later" have meaning
+  validation either aborts, or causes later xactions to see earlier writes
+  if later xaction overlaps -- it will abort
+  if later xaction doesn't overlap -- it can commit
+  suppose T1 gets lock first
+    if T1 commits before T2's Rx, T2 will see the write
+    if T1 commits after T2's Rx, T2's LOCK will see lock or higher version, and T2 aborts
+    if T1 commits same time as T2's Rx, cache coherence forces one order or the other
+
+what about transactions that write objects on multiple primaries?
+  the order is set by the point at which a transaction successfully gets last lock
+  called the "serialization point"
+  b/c it defines the equivalent serial order for conflicting transactions
+
+what about VALIDATE in Figure 4?
+  it is an optimization for objects that are just read by a transaction
+  one-sided RDMA read to fetch object's current version # and lock flag
+  if lock set, or version # changed since read, abort
+  does not set the lock, thus faster than LOCK
+
+why is VALIDATE correct -- it doesn't set the lock!
+  so it doesn't directly force ordering.
+  the exciting situation is when two transactions conflict over *multiple*
+    variables with read/write conflicts but not write/write (which orders).
+    the order decision has to be the same for all objects
+
+example for VALIDATE:
+x and y initially zero
+T1:
+  if x == 0:
+    y = 1
+T2:
+  if y == 0:
+    x = 1
+(this is a classic diagnostic example for consistency, saw it in Russ Cox's lecture)
+T1,T2 yields y=1,x=0
+T2,T1 yields x=1,y=0
+but we can't end up with both x=1 and y=1
+and this is a situation in which there are two read/write conflicts
+  and we're hoping VALIDATE orders both the same way despite not locking
+suppose all simultaneous:
+  T1:  Rx  Ly  Vx  Cy
+  T2:  Ry  Lx  Vy  Cx
+  the LOCKs will both succeed
+  the VALIDATEs will both fail, since lock bits are both set
+  so both will abort -- which is OK
+suppose T1's Vx happens before T2's Lx
+  then T1 commits, T2 still aborts since T2's Vy sees T1's lock
+but we can't have *both* V's before the L's
+  since each TC issues L, then V
+so VALIDATE seems correct in this example -- and faster than LOCK
+
+what about fault tolerance?
+  FaRM replicates data so it can proceed even if some servers are down.
+  FaRM replicates LOCK/COMMIT log entries so that recovery can finish
+    transactions even if some servers are down (e.g. TC or primary).
+    (this is the new and interesting property)
+
+high-level replication diagram
+  one ZooKeeper cluster (a handful of replicas)
+    stores just configuration #, set of servers in this config, and CM
+  a Configuration Manager (CM) (not replicated)
+    assigns shards to primary/backup sets
+    monitors liveness of all servers
+  for each shard, a Primary and one or more Backups
+
+*all* of a primary's backups have to see every write!
+  not just a majority
+  TC will wait indefinitely for backup to respond, though if it's
+    dead/unreachable, the CM will notice and start a reconfiguration
+
+suppose there is a partition (this is the most interesting failure case)
+  ZooKeeper will be reachable from at most one partition
+    b/c ZooKeeper uses a Raft-like majority scheme
+  one server will win the ZooKeeper atomic compare-and-swap to be new CM
+  some subset of the servers (primaries and backups) will be reachable from CM
+  CM needs only one backup from each shard, since all backups see all writes
+  CM collects logs from all servers to find set of active transactions
+  CM uses log info to decide if each transaction might have committed
+    can't ask TC since it isn't replicated
+
+let's look back the at the Figure 4 commit protocol to see how
+  any xaction that might have committed will be visible despite failed servers.
+
+after TC sees "yes" from all LOCKs and VALIDATEs,
+  TC appends COMMIT-BACKUP to each backup's log
+  after all ack, appends COMMIT-PRIMARY to each primary's log
+  after one ack, reports "commit" to application
+
+note TC replicates to backups; primaries don't replicate
+  COMMIT-BACKUP contains written value, enough to update backup's state
+
+why TC sends COMMIT-PRIMARY only after acks for *all* COMMIT-BACKUPs?
+  a primary may execute as soon as it sees COMMIT-PRIMARY
+    and show the update to other transactions
+  so by that point each object's new value must in f+1 logs
+    so f can fail without losing the new value
+  if there's even one backup that doesn't have the COMMIT-BACKUP
+    that object's writes are in only f logs
+    all f could fail along with TC
+    then we'd have exposed commit but maybe permanently lost one write!
+
+why TC waits for an ack from a COMMIT-PRIMARY?
+  so that there is a complete f+1 shard that's aware of the commit
+  before then, only f backups per shard knew (from COMMIT-BACKUPs)
+  but we're assuming up to f per shard to fail
+
+the basic line of reasoning for why recovery is possible:
+  if TC could have reported "commit", or a primary could have exposed value,
+  then all f+1 in each shard have LOCK or COMMIT-BACKUP in log,
+  so f can fail from any/every shard without losing writes.
+  if recovery sees one or more COMMIT-*, and a COMMIT-* or LOCK
+    from each shard, it commits; otherwise aborts.
+    i.e. evidence TC decided commit, plus each object's writes.
+    (Section 5.3, Step 7)
+
+FaRM is very impressive; does it fall short of perfection?
+  * works best if few conflicts, due to OCC.
+  * data must fit in total RAM.
+  * the data model is low-level; would need e.g. SQL library.
+  * transaction API is a bit awkward due callbacks.
+
+summary
+  distributed transactions have been viewed as too slow for serious use
+  maybe FaRM demonstrates that needn't be true
