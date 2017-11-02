@@ -29,7 +29,6 @@ Git会帮助你追踪你对代码的修改情况。例如,如果你们向检查�
 
 ### 序言： 熟悉源代码
 mapreduce包一顺序的方式实现了简单的Map/Reduce库。应用程序应该调用Distributed函数(位于master.go)启动一个工作，但是也许会调用Sequential方法替换(同样在master.go)
-Preamble: Getting familiar with the source
 
 mapreduce的实现如下所述：
 + 1：应用程序提供很多输入文件，map函数，reduce函数和很多Reduce任务(nReduce)
@@ -169,7 +168,7 @@ Map/Reduce一个大的卖点是开发者不需要在多台机器上面并行运�
 
 当我们通过执行上面的命令运行你的程序，如果你的软件通过了这些测试，你将会获取到这个部分的全部积分。
 
-#### 第五部分：反向索引Inverted index generation (optional)
+#### 第五部分：反向索引(可选的)
 Word count是一个典型的Map/Reduce应用，但是它不是一个大规模消费者使用Map/Reduce的例子。它非常简单，现实中很少需要你从一个大的数据集里面统计单词的数量。在这个具有挑战性的练习中，我们代替你已经建立用于生成反向索引的Map和Reduce函数。
 
 反向索引在计算机科学领域被广泛使用，尤其在文档搜索方面。广义地说，一个反向索引就是map,存在底层数据的一些有趣的事实，说明数据的原始位置。例如，在文本搜索的时候，反向索引也许是这样的map,它包含了两个单词从关键字指向文档.??
