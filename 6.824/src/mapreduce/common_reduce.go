@@ -1,11 +1,9 @@
 package mapreduce
 
 import (
-	"fmt"
-	"os"
 	"encoding/json"
-	"io"
 	"log"
+	"os"
 )
 
 // doReduce does the job of a reduce worker: it reads the intermediate
@@ -53,4 +51,29 @@ func doReduce(
 	// 　S2：获取中间文件的数据(对多个map产生的文件更加值合并)
 	// 　S3：打开文件（mergeName获取文件名），将用于存储Reduce任务的结果
 	// 　S4：合并结果之后(S2)，进行reduceF操作, work count的操作将结果累加，也就是word出现在这个文件中出现的次数
+	for i := 0 ; i < nMap; i++ {
+		reduceFile, err := os.Open(reduceName(jobName, i, reduceTaskNumber))
+		if err != nil {
+			log.Fatal("doReduce: ", err)
+		}
+
+		kvs := make(map[string] []string)
+		dec := json.NewDecoder(reduceFile) // json数据的流式读写
+		for {
+			var kv KeyValue
+			err = dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			_ = append(kvs[kv.Key], kv.Value)
+		}
+		reduceFile.Close()
+		
+		mergeFile, err := os.OpenFile(mergeName(jobName, i), os.O_RDWR|os.O_CREATE,0)
+		enc := json.NewEncoder(mergeFile)
+		for key, values := range kvs {
+			enc.Encode(KeyValue{key, reduceF(key, values)})
+		}
+		mergeFile.Close()
+	}
 }

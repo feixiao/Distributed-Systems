@@ -1,11 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
 	"io/ioutil"
+	"log"
 	"os"
-	"encoding/json"
-	"fmt"
 )
 
 // doMap does the job of a map worker: it reads one of the input files
@@ -71,6 +71,25 @@ func doMap(
 	//  S3： 将mapF返回的数据根据key分类,跟文件名对应(reduceName获取文件名)
 	// 　S4: 　将分类好的数据分别写入不同文件
 
+	b, err := ioutil.ReadFile(inFile)
+	if err != nil {
+		log.Fatal("ReadFile: ", err)
+	}
+	res := mapF(inFile, string(b))
+
+	for _, word := range res {
+		reduceId := ihash(word.Key)
+		reduceId = reduceId % uint32(nReduce)
+		reduceFile, err := os.OpenFile(reduceName(jobName, mapTaskNumber, int(reduceId)), os.O_RDWR|os.O_CREATE,0)
+		if err != nil {
+			log.Fatal("OpenFile: ", err)
+		}
+
+		err = json.NewEncoder(reduceFile).Encode(&word)
+		if err != nil {
+			log.Fatal("Encode: ", err)
+		}
+	}
 }
 
 func ihash(s string) uint32 {
